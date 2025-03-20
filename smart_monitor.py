@@ -20,7 +20,12 @@ import ctypes
 import platform
 
 # Constants
-SMARTMONTOOLS_URL = "https://sourceforge.net/projects/smartmontools/files/smartmontools/7.3/smartmontools-7.3-1.win32-setup.exe/download"
+SMARTMONTOOLS_URLS = [
+    "https://sourceforge.net/projects/smartmontools/files/smartmontools/7.3/smartmontools-7.3-1.win32-setup.exe/download",
+    "https://github.com/smartmontools/smartmontools/releases/download/RELEASE_7_3/smartmontools-7.3-1.win32-setup.exe",
+    "https://mirror.umd.edu/osdn/storage/g/s/sm/smartmontools/smartmontools/7.3/smartmontools-7.3-1.win32-setup.exe",
+    "https://osdn.net/projects/smartmontools/downloads/smartmontools/7.3/smartmontools-7.3-1.win32-setup.exe"
+]
 TEMP_DIR = tempfile.gettempdir()
 EXTRACT_DIR = os.path.join(TEMP_DIR, "SmartMonTools")
 SMARTCTL_PATH = os.path.join(EXTRACT_DIR, "bin", "smartctl.exe")
@@ -36,7 +41,16 @@ def download_file(url, destination):
     """Download a file from a URL to a destination"""
     try:
         print(f"Downloading from {url} to {destination}")
-        urllib.request.urlretrieve(url, destination)
+        
+        # Set up proxy handler if needed
+        proxy_handler = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(proxy_handler)
+        
+        # Set a reasonable timeout
+        req = urllib.request.Request(url)
+        with opener.open(req, timeout=30) as response, open(destination, 'wb') as out_file:
+            shutil.copyfileobj(response, out_file)
+        
         return True
     except Exception as e:
         print(f"Error downloading file: {e}")
@@ -69,9 +83,19 @@ def initialize_smartmontools():
     # Create extraction directory if it doesn't exist
     os.makedirs(EXTRACT_DIR, exist_ok=True)
     
-    # Download the installer
+    # Download the installer from one of the available URLs
     download_path = os.path.join(TEMP_DIR, "smartmontools-setup.exe")
-    if not download_file(SMARTMONTOOLS_URL, download_path):
+    download_success = False
+    
+    for url in SMARTMONTOOLS_URLS:
+        print(f"Trying to download SmartMonTools from: {url}")
+        if download_file(url, download_path):
+            download_success = True
+            break
+    
+    if not download_success:
+        print("ERROR: Failed to download SmartMonTools from any of the available sources.")
+        print("Please check your internet connection, firewall settings, or proxy configuration.")
         return None
     
     # Extract the files
