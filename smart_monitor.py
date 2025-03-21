@@ -30,6 +30,15 @@ TEMP_DIR = tempfile.gettempdir()
 EXTRACT_DIR = os.path.join(TEMP_DIR, "SmartMonTools")
 SMARTCTL_PATH = os.path.join(EXTRACT_DIR, "bin", "smartctl.exe")
 
+# Kingston SSD specific attribute IDs
+KINGSTON_ATTRIBUTES = {
+    "Temperature": [194, 190],  # Common temperature attribute IDs
+    "PowerOnHours": [9],        # Power-on hours attribute ID
+    "LifeRemaining": [231, 232, 233],  # Life remaining related attributes
+    "TotalWritten": [241, 246], # Total data written attributes
+    "TotalRead": [242, 247]     # Total data read attributes
+}
+
 def is_admin():
     """Check if the script is running with administrative privileges"""
     try:
@@ -119,6 +128,7 @@ def run_smartctl(smartctl_path, args):
     """Run smartctl with the given arguments and return the output"""
     try:
         cmd = [smartctl_path] + args
+        print(f"DEBUG: Running command: {' '.join(cmd)}")
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
                                text=True, encoding='utf-8', errors='replace')
         return process.stdout + process.stderr
@@ -224,6 +234,9 @@ def get_disk_info(smartctl_path, disk_id):
         disk_info["IsSSD"] = True
     elif "SSD" in disk_info["Model"]:
         disk_info["IsSSD"] = True
+    # Additional check for Kingston SSDs
+    elif "KINGSTON" in disk_info["Model"].upper() and "SA400" in disk_info["Model"].upper():
+        disk_info["IsSSD"] = True
     
     # Get health information
     health_output = run_smartctl(smartctl_path, ["-H", disk_id])
@@ -242,33 +255,94 @@ def get_disk_info(smartctl_path, disk_id):
     
     # Get all SMART attributes
     attr_output = run_smartctl(smartctl_path, ["-A", disk_id])
+    
+    # If no attributes found with -A, try with -x for more comprehensive output
+    if not attr_output or "No SMART attributes found" in attr_output:
+        attr_output = run_smartctl(smartctl_path, ["-x", disk_id])
+    
     if not attr_output:
         return disk_info
     
-    # Parse temperature
-    temp_match = re.search(r'Temperature_Celsius.*?(\d+)', attr_output)
-    if temp_match:
-        disk_info["Attributes"]["Temperature"] = f"{temp_match.group(1)} °C"
-    else:
-        # Try alternative temperature patterns
-        alt_temp_match = re.search(r'(Airflow_Temperature_Cel|Temperature).*?(\d+)', attr_output)
-        if alt_temp_match:
-            disk_info["Attributes"]["Temperature"] = f"{alt_temp_match.group(2)} °C"
-        else:
-            # Try NVMe temperature
-            nvme_temp_match = re.search(r'Temperature:\s+(\d+)\s+Celsius', attr_output)
-            if nvme_temp_match:
-                disk_info["Attributes"]["Temperature"] = f"{nvme_temp_match.group(1)} °C"
+    # Save raw output for debugging
+    with open(os.path.join(TEMP_DIR, f"smart_debug_{disk_info['Model'].replace(' ', '_')}.txt"), "w") as f:
+        f.write(f"Info Output:\n{info_output}\n\nHealth Output:\n{health_output}\n\nAttribute Output:\n{attr_output}")
     
-    # Parse Power-On Hours
-    poh_match = re.search(r'Power_On_Hours.*?(\d+)', attr_output)
-    if poh_match:
-        disk_info["Attributes"]["PowerOnTime"] = parse_power_on_hours(poh_match.group(1))
-    else:
-        # Try NVMe power-on hours
-        nvme_poh_match = re.search(r'Power On Hours:\s+(\d+)', attr_output)
-        if nvme_poh_match:
-            disk_info["Attributes"]["PowerOnTime"] = parse_power_on_hours(nvme_poh_match.group(1))
+    # Check if this is a Kingston SSD
+    is_kingston = "KINGSTON" in disk_info["Model"].upper()
+    
+    # If it's a Kingston SSD, try to parse attributes by ID
+    if is_kingston and disk_info["IsSSD"]:
+        print(f"DEBUG: Processing Kingston SSD specific attributes for {disk_id}")
+        
+        # Try to extract raw attribute data by ID for Kingston SSDs
+        for attr_name, attr_ids in KINGSTON_ATTRIBUTES.items():
+            for attr_id in attr_ids:
+                pattern = rf'^\s*{attr_id}\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)'
+                matches = re.finditer(pattern, attr_output, re.MULTILINE)
+                for match in matches:
+                    raw_value = match.group(1)
+                    if attr_name == "Temperature" and raw_value.isdigit():
+                        disk_info["Attributes"]["Temperature"] = f"{raw_value} °C"
+                        break
+                    elif attr_name == "PowerOnHours" and raw_value.isdigit():
+                        disk_info["Attributes"]["PowerOnTime"] = parse_power_on_hours(raw_value)
+                        break
+                    elif attr_name == "LifeRemaining" and raw_value.isdigit():
+                        disk_info["Attributes"]["LifeRemaining"] = f"{raw_value}%"
+                        break
+                    elif attr_name == "TotalWritten" and raw_value.isdigit():
+                        disk_info["Attributes"]["TotalWritten"] = parse_lba_to_tb(raw_value)
+                        break
+                    elif attr_name == "TotalRead" and raw_value.isdigit():
+                        disk_info["Attributes"]["TotalRead"] = parse_lba_to_tb(raw_value)
+                        break
+    
+    # Parse temperature
+    if disk_info["Attributes"]["Temperature"] == "N/A":
+        temp_match = re.search(r'Temperature_Celsius.*?(\d+)', attr_output)
+        if temp_match:
+            disk_info["Attributes"]["Temperature"] = f"{temp_match.group(1)} °C"
+        else:
+            # Try alternative temperature patterns
+            alt_temp_match = re.search(r'(Airflow_Temperature_Cel|Temperature).*?(\d+)', attr_output)
+            if alt_temp_match:
+                disk_info["Attributes"]["Temperature"] = f"{alt_temp_match.group(2)} °C"
+            else:
+                # Try NVMe temperature
+                nvme_temp_match = re.search(r'Temperature:\s+(\d+)\s+Celsius', attr_output)
+                if nvme_temp_match:
+                    disk_info["Attributes"]["Temperature"] = f"{nvme_temp_match.group(1)} °C"
+                else:
+                    # Try additional temperature patterns for Kingston SSDs
+                    kingston_temp_match = re.search(r'Current Temperature:\s+(\d+)', attr_output, re.IGNORECASE)
+                    if kingston_temp_match:
+                        disk_info["Attributes"]["Temperature"] = f"{kingston_temp_match.group(1)} °C"
+                    else:
+                        # Try to find any temperature-related line
+                        any_temp_match = re.search(r'[Tt]emp(?:erature)?.*?(\d+)', attr_output)
+                        if any_temp_match:
+                            disk_info["Attributes"]["Temperature"] = f"{any_temp_match.group(1)} °C"
+    
+    # Parse Power-On Hours if not already set by Kingston specific processing
+    if disk_info["Attributes"]["PowerOnTime"] == "N/A":
+        poh_match = re.search(r'Power_On_Hours.*?(\d+)', attr_output)
+        if poh_match:
+            disk_info["Attributes"]["PowerOnTime"] = parse_power_on_hours(poh_match.group(1))
+        else:
+            # Try NVMe power-on hours
+            nvme_poh_match = re.search(r'Power On Hours:\s+(\d+)', attr_output)
+            if nvme_poh_match:
+                disk_info["Attributes"]["PowerOnTime"] = parse_power_on_hours(nvme_poh_match.group(1))
+            else:
+                # Try additional patterns for Kingston SSDs
+                kingston_poh_match = re.search(r'Power_On_Time.*?(\d+)', attr_output)
+                if kingston_poh_match:
+                    disk_info["Attributes"]["PowerOnTime"] = parse_power_on_hours(kingston_poh_match.group(1))
+                else:
+                    # Try to find any hours/time related attribute
+                    any_hours_match = re.search(r'(?:Hours|Time).*?(\d+)', attr_output)
+                    if any_hours_match:
+                        disk_info["Attributes"]["PowerOnTime"] = parse_power_on_hours(any_hours_match.group(1))
     
     # HDD specific attributes
     if not disk_info["IsSSD"]:
@@ -309,6 +383,11 @@ def get_disk_info(smartctl_path, disk_id):
                     disk_info["Attributes"]["LifeRemaining"] = f"{life_remaining}%"
                 except:
                     pass
+            else:
+                # Try Kingston specific patterns
+                kingston_life_match = re.search(r'(?:Health|Life|Wear).*?(\d+)%', attr_output, re.IGNORECASE)
+                if kingston_life_match:
+                    disk_info["Attributes"]["LifeRemaining"] = f"{kingston_life_match.group(1)}%"
         
         # Total data written
         written_match = re.search(r'Total_LBAs_Written.*?(\d+)', attr_output)
@@ -326,6 +405,11 @@ def get_disk_info(smartctl_path, disk_id):
                     disk_info["Attributes"]["TotalWritten"] = f"{tb_value} TB"
                 except:
                     pass
+            else:
+                # Try Kingston specific patterns
+                kingston_written_match = re.search(r'(?:Host_Writes|Total_Writes).*?(\d+)', attr_output)
+                if kingston_written_match:
+                    disk_info["Attributes"]["TotalWritten"] = parse_lba_to_tb(kingston_written_match.group(1))
         
         # Total data read
         read_match = re.search(r'Total_LBAs_Read.*?(\d+)', attr_output)
@@ -343,6 +427,11 @@ def get_disk_info(smartctl_path, disk_id):
                     disk_info["Attributes"]["TotalRead"] = f"{tb_value} TB"
                 except:
                     pass
+            else:
+                # Try Kingston specific patterns
+                kingston_read_match = re.search(r'(?:Host_Reads|Total_Reads).*?(\d+)', attr_output)
+                if kingston_read_match:
+                    disk_info["Attributes"]["TotalRead"] = parse_lba_to_tb(kingston_read_match.group(1))
     
     return disk_info
 
@@ -383,6 +472,15 @@ def main():
         for disk_id in disk_ids:
             try:
                 print(f"Processing disk: {disk_id}")
+                
+                # Get detailed disk info for debugging
+                print(f"DEBUG: Getting detailed info for {disk_id}")
+                detailed_output = run_smartctl(smartctl_path, ["-x", disk_id])
+                debug_file = os.path.join(TEMP_DIR, f"smart_debug_raw_{disk_id.replace('/', '_')}.txt")
+                with open(debug_file, "w") as f:
+                    f.write(detailed_output)
+                print(f"DEBUG: Raw output saved to {debug_file}")
+                
                 disk_info = get_disk_info(smartctl_path, disk_id)
                 
                 disk_type = "SSD" if disk_info["IsSSD"] else "HDD"
